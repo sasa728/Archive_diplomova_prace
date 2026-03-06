@@ -1,0 +1,198 @@
+=============================
+======== CREDENTIALS ========
+=============================
+
+========================================================================================
+| Nástroj         | URL adresa                   | Výchozí jméno    | Výchozí heslo    |
+========================================================================================
+| Wazuh Dashboard | https://192.168.82.131       | admin            | SecretPassword   |
+| Zabbix Web      | http://192.168.82.131:8080   | Admin (velké A!) | zabbix           |
+| Grafana         | http://192.168.82.131:3000   | admin            | admin            |
+| Greenbone (GSA) | http://192.168.82.131:9392   | admin            | admin * |
+========================================================================================
+* Upozornění pro Greenbone: Heslo bude platné až po spuštění příkazu pro jeho vytvoření
+  (docker compose exec -u gvmd gvmd gvmd --user=admin --new-password=admin),
+  který lze spustit až po kompletním dokončení úvodní inicializace databáze.
+
+=============================
+======= DOCKER SERVER =======
+=============================
+
+# 1. Příprava systému a instalace Dockeru
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y ca-certificates curl gnupg git
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $USER
+newgrp docker
+
+# 2. Vytvoření síťové infrastruktury a složek
+docker network create soc-network
+cd ~
+mkdir -p security/{wazuh,zabbix,greenbone,grafana,python}
+
+# ---------------------------------------------
+# 3. NASAZENÍ APLIKACÍ
+# ---------------------------------------------
+
+# --- ZABBIX ---
+cd ~/security/zabbix
+# (Zde vytvořen docker-compose.yml dle šablony s restart: unless-stopped)
+docker compose up -d
+
+# --- GRAFANA ---
+cd ~/security/grafana
+# Řešení problému s právy: Kontejner Grafany (ID 472) potřebuje práva k namapované složce
+sudo chown -R 472:472 ~/security/grafana/grafana_data
+docker compose up -d
+
+# --- WAZUH ---
+cd ~/security/wazuh
+git clone https://github.com/wazuh/wazuh-docker.git -b v4.9.0 .
+cd single-node
+# V docker-compose.yml vystaveny porty: 1514, 1515, 514/udp, 55000
+docker compose -f generate-indexer-certs.yml run --rm generator
+docker compose up -d
+
+# --- GREENBONE ---
+cd ~/security/greenbone
+# (V docker-compose.yml upraven port na 9392:9392 a přidán gmp-proxy sidecar pro API na 9390)
+docker compose up -d
+# Změna hesla (až po vytvoření DB):
+# docker compose exec -u gvmd gvmd gvmd --user=admin --new-password=admin
+
+# --- PYTHON INTEGRACE ---
+cd ~/security/python
+nano Dockerfile
+mkdir app
+echo "requests" > requirements.txt
+touch app/main.py
+docker compose build
+docker compose up -d
+
+==============================
+= DOCKER SERVER (MONITORING) =
+==============================
+# IP adresa: 192.168.82.131 (lokální instalace agentů)
+
+# ---------------------------------------------
+# 1. WAZUH AGENT
+# ---------------------------------------------
+curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | sudo gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import && sudo chmod 644 /usr/share/keyrings/wazuh.gpg
+echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" | sudo tee -a /etc/apt/sources.list.d/wazuh.list
+sudo apt-get update
+sudo WAZUH_MANAGER="127.0.0.1" apt-get install wazuh-agent=4.9.0-1 -y
+sudo systemctl daemon-reload
+sudo systemctl enable wazuh-agent
+sudo systemctl start wazuh-agent
+
+# ---------------------------------------------
+# 2. ZABBIX AGENT 2 (Šifrováno PSK)
+# ---------------------------------------------
+wget https://repo.zabbix.com/zabbix/6.4/ubuntu/pool/main/z/zabbix-release/zabbix-release_6.4-1+ubuntu22.04_all.deb
+sudo dpkg -i zabbix-release_6.4-1+ubuntu22.04_all.deb
+sudo apt update
+sudo apt install zabbix-agent2 -y
+
+sudo ufw allow 10050/tcp
+openssl rand -hex 32 | sudo tee /etc/zabbix/zabbix_agent2_docker.psk
+sudo chown zabbix:zabbix /etc/zabbix/zabbix_agent2_docker.psk
+sudo chmod 640 /etc/zabbix/zabbix_agent2_docker.psk
+
+sudo sed -i 's/Server=127.0.0.1/Server=127.0.0.1,192.168.82.131,172.16.0.0\/12/g' /etc/zabbix/zabbix_agent2.conf
+sudo sed -i 's/ServerActive=127.0.0.1/ServerActive=127.0.0.1/g' /etc/zabbix/zabbix_agent2.conf
+sudo sed -i 's/Hostname=Zabbix server/Hostname=Docker-Server/g' /etc/zabbix/zabbix_agent2.conf
+echo -e "\nTLSConnect=psk\nTLSAccept=psk\nTLSPSKIdentity=PSK-Docker\nTLSPSKFile=/etc/zabbix/zabbix_agent2_docker.psk" | sudo tee -a /etc/zabbix/zabbix_agent2.conf
+
+sudo systemctl restart zabbix-agent2
+sudo systemctl enable zabbix-agent2
+
+==============================
+========= LINUX HOST =========
+==============================
+# IP adresa: 192.168.83.192
+
+# ---------------------------------------------
+# 1. WAZUH AGENT
+# ---------------------------------------------
+curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | sudo gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import && sudo chmod 644 /usr/share/keyrings/wazuh.gpg
+echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" | sudo tee -a /etc/apt/sources.list.d/wazuh.list
+sudo apt-get update
+sudo WAZUH_MANAGER="192.168.82.131" apt-get install wazuh-agent=4.9.0-1 -y
+sudo systemctl daemon-reload
+sudo systemctl enable wazuh-agent
+sudo systemctl start wazuh-agent
+
+# ---------------------------------------------
+# 2. ZABBIX AGENT 2 (Šifrováno PSK)
+# ---------------------------------------------
+wget https://repo.zabbix.com/zabbix/6.4/ubuntu/pool/main/z/zabbix-release/zabbix-release_6.4-1+ubuntu22.04_all.deb
+sudo dpkg -i zabbix-release_6.4-1+ubuntu22.04_all.deb
+sudo apt update
+sudo apt install zabbix-agent2 -y
+
+sudo ufw allow 10050/tcp
+openssl rand -hex 32 | sudo tee /etc/zabbix/zabbix_agent2.psk
+sudo chown zabbix:zabbix /etc/zabbix/zabbix_agent2.psk
+sudo chmod 640 /etc/zabbix/zabbix_agent2.psk
+
+sudo sed -i 's/Server=127.0.0.1/Server=192.168.82.131/g' /etc/zabbix/zabbix_agent2.conf
+sudo sed -i 's/ServerActive=127.0.0.1/ServerActive=192.168.82.131/g' /etc/zabbix/zabbix_agent2.conf
+sudo sed -i 's/Hostname=Zabbix server/Hostname=Ubuntu-Host/g' /etc/zabbix/zabbix_agent2.conf
+echo -e "\nTLSConnect=psk\nTLSAccept=psk\nTLSPSKIdentity=PSK-Ubuntu\nTLSPSKFile=/etc/zabbix/zabbix_agent2.psk" | sudo tee -a /etc/zabbix/zabbix_agent2.conf
+
+sudo systemctl restart zabbix-agent2
+sudo systemctl enable zabbix-agent2
+
+==============================
+======== WINDOWS HOST ========
+==============================
+# IP adresa: 192.168.83.215
+
+# ---------------------------------------------
+# 1. WAZUH AGENT
+# ---------------------------------------------
+# Spustit PowerShell jako Správce:
+Invoke-WebRequest -Uri https://packages.wazuh.com/4.x/windows/wazuh-agent-4.9.0-1.msi -OutFile ${env:tmp}\wazuh-agent.msi; msiexec.exe /i ${env:tmp}\wazuh-agent.msi /q WAZUH_MANAGER="192.168.82.131" WAZUH_REGISTRATION_SERVER="192.168.82.131"; NET START WazuhSvc
+
+# ---------------------------------------------
+# 2. ZABBIX AGENT 2
+# ---------------------------------------------
+# 1. Stáhnout MSI instalátor z webu Zabbixu.
+# 2. Vyplnit: Host name (Windows10-Host), Server IP (192.168.82.131), Server active IP (192.168.82.131).
+
+==============================
+=== PŘIDÁNÍ DAT DO SYSTÉMŮ ===
+==============================
+
+# --- WAZUH ---
+# Agenti se po instalaci registrují zcela automaticky (komunikace je defaultně šifrovaná AES).
+# Ověření: Wazuh Dashboard -> Agents.
+
+# --- ZABBIX ---
+# Nutno přidat manuálně přes web (Data collection -> Hosts -> Create host):
+# 1. Ubuntu (Šifrováno PSK): 
+#    - Host name: Ubuntu-Host
+#    - Templates: Linux by Zabbix agent
+#    - Host groups: Linux servers
+#    - Interfaces: Agent -> IP: 192.168.83.192, Port: 10050
+#    - Encryption: PSK (Connections to/from), Identity: PSK-Ubuntu, vložit vygenerovaný klíč.
+# 2. Docker-Server (Šifrováno PSK):
+#    - Host name: Docker-Server
+#    - Templates: Linux by Zabbix agent
+#    - Host groups: Linux servers
+#    - Interfaces: Agent -> IP: 192.168.82.131, Port: 10050
+#    - Encryption: PSK (Connections to/from), Identity: PSK-Docker, vložit vygenerovaný klíč.
+# 3. Windows:
+#    - Host name: Windows10-Host
+#    - Templates: Windows by Zabbix agent
+#    - Interfaces: Agent -> IP: 192.168.83.215, Port: 10050
+
+# --- GREENBONE ---
+# Agentless přístup. Nastavení přes webové rozhraní (Scans -> Tasks):
+# 1. Kliknout na Task Wizard.
+# 2. Zadat IP adresu cíle a kliknout na "Start Scans".

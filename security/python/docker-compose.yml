@@ -1,0 +1,15 @@
+version: '3.5'
+
+services:
+  integration-script:
+    build: .
+    container_name: python-integrator
+    restart: unless-stopped
+    volumes:
+      - ./app:/app
+    networks:
+      - soc-network
+
+networks:
+  soc-network:
+    external: true
