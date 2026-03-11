@@ -1,14 +1,37 @@
-version: '3.5'
-
 services:
-  integration-script:
-    build: .
-    container_name: python-integrator
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: postgres-db
     restart: unless-stopped
-    volumes:
-      - ./app:/app
+    environment:
+      - POSTGRES_USER=soc_user
+      - POSTGRES_PASSWORD=SecurityPassword123
+      - POSTGRES_DB=soc_data
     networks:
       - soc-network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  python-app:
+    build: .
+    container_name: python-integration
+    restart: unless-stopped
+    depends_on:
+      - postgres-db
+    networks:
+      - soc-network
+    volumes:
+      - ./app:/app
+    environment:
+      - DB_HOST=postgres-db
+      - DB_NAME=soc_data
+      - DB_USER=soc_user
+      - DB_PASS=SecurityPassword123
+
+volumes:
+  postgres_data:
 
 networks:
   soc-network:

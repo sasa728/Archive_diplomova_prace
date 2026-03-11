@@ -3,12 +3,15 @@
 =============================
 
 ========================================================================================
-| Nástroj         | URL adresa                   | Výchozí jméno    | Výchozí heslo    |
+| Nástroj         | URL adresa                     | Jméno            | Heslo              |
 ========================================================================================
-| Wazuh Dashboard | https://192.168.82.131       | admin            | SecretPassword   |
-| Zabbix Web      | http://192.168.82.131:8080   | Admin (velké A!) | zabbix           |
-| Grafana         | http://192.168.82.131:3000   | admin            | admin            |
-| Greenbone (GSA) | http://192.168.82.131:9392   | admin            | admin * |
+| Wazuh Dashboard | https://192.168.82.131         | admin            | SecretPassword     |
+| Wazuh Indexer   | https://192.168.82.131:9200    | admin            | SecretPassword     |
+| Wazuh Manager   | https://192.168.82.131:55000   | wazuh-wui        | MyS3cr37P450r.*-   |
+| Zabbix Web      | http://192.168.82.131:8080     | Admin (velké A!) | zabbix             |
+| Grafana         | http://192.168.82.131:3000     | admin            | admin              |
+| Greenbone (GSA) | https://192.168.82.131:8443/   | admin            | admin              |
+| Postgres DB     | (uvnitř soc-network)           | soc_user         | SecurityPassword123|
 ========================================================================================
 * Upozornění pro Greenbone: Heslo bude platné až po spuštění příkazu pro jeho vytvoření
   (docker compose exec -u gvmd gvmd gvmd --user=admin --new-password=admin),
@@ -58,19 +61,43 @@ cd single-node
 docker compose -f generate-indexer-certs.yml run --rm generator
 docker compose up -d
 
+# --- WAZUH - VLASTNÍ PRAVIDLA (local_rules.xml) ---
+# V kontejneru manageru: /var/ossec/etc/rules/local_rules.xml
+<group name="local,syslog,sshd,">
+  <rule id="5760" level="10" overwrite="yes">
+    <if_sid>5700,5716</if_sid>
+    <match>Failed password|Failed keyboard|authentication error</match>
+    <description>sshd: authentication failed (Medium Severity)</description>
+    <group>authentication_failed,soc_medium</group>
+  </rule>
+  <rule id="5710" level="15" overwrite="yes">
+    <if_sid>5700</if_sid>
+    <match>illegal user|invalid user</match>
+    <description>sshd: Attempt to login using a NON-EXISTENT user (Critical Severity)</description>
+    <group>authentication_failed,invalid_login,soc_critical</group>
+  </rule>
+</group>
+
+# --- WAZUH - CENTRÁLNÍ KONFIGURACE (Management -> Groups -> Agent.conf) ---
+<agent_config>
+  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/log/auth.log</location>
+  </localfile>
+</agent_config>
+
 # --- GREENBONE ---
 cd ~/security/greenbone
-# (V docker-compose.yml upraven port na 9392:9392 a přidán gmp-proxy sidecar pro API na 9390)
+# (Zde byl stažen oficiální compose.yaml z dokumentace.
+# Port pro webové rozhraní (NGINX) byl změněn z 443 na 8443, aby nekolidoval s Wazuhem.
+# Na konec souboru byla přidána služba gmp-proxy pro zpřístupnění API na portu 9390.)
+docker compose pull
 docker compose up -d
-# Změna hesla (až po vytvoření DB):
-# docker compose exec -u gvmd gvmd gvmd --user=admin --new-password=admin
 
 # --- PYTHON INTEGRACE ---
 cd ~/security/python
-nano Dockerfile
-mkdir app
-echo "requests" > requirements.txt
-touch app/main.py
+# Používá SOC INTEGRATOR v2.1 pro sběr dat z Wazuhu do Postgresu
+# Zahrnuje Source IP, Destination IP a Agent ID.
 docker compose build
 docker compose up -d
 
@@ -86,6 +113,7 @@ curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | sudo gpg --no-default-key
 echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" | sudo tee -a /etc/apt/sources.list.d/wazuh.list
 sudo apt-get update
 sudo WAZUH_MANAGER="127.0.0.1" apt-get install wazuh-agent=4.9.0-1 -y
+sudo usermod -aG adm wazuh  # Nutné pro čtení auth.log
 sudo systemctl daemon-reload
 sudo systemctl enable wazuh-agent
 sudo systemctl start wazuh-agent
@@ -123,6 +151,7 @@ curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | sudo gpg --no-default-key
 echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" | sudo tee -a /etc/apt/sources.list.d/wazuh.list
 sudo apt-get update
 sudo WAZUH_MANAGER="192.168.82.131" apt-get install wazuh-agent=4.9.0-1 -y
+sudo usermod -aG adm wazuh  # Nutné pro čtení auth.log
 sudo systemctl daemon-reload
 sudo systemctl enable wazuh-agent
 sudo systemctl start wazuh-agent
@@ -170,8 +199,13 @@ Invoke-WebRequest -Uri https://packages.wazuh.com/4.x/windows/wazuh-agent-4.9.0-
 ==============================
 
 # --- WAZUH ---
-# Agenti se po instalaci registrují zcela automaticky (komunikace je defaultně šifrovaná AES).
-# Ověření: Wazuh Dashboard -> Agents.
+# Agenti se po instalaci registrují automaticky.
+# Nutno aktivovat zranitelnosti a FIM:
+# 1. Management -> Configuration -> Edit configuration
+# 2. Zapnout <vulnerability-detector> na <enabled>yes</enabled> a u daných OS (Ubuntu, Windows) také yes.
+# 3. Zkontrolovat zapnutí modulu syscheck (Integrity monitoring).
+# 4. Uložit a restartovat managera.
+# Pro vynucení okamžitých alertů lze na klientovi restartovat agenta a zkusit se 6-8x přihlásit se špatným heslem.
 
 # --- ZABBIX ---
 # Nutno přidat manuálně přes web (Data collection -> Hosts -> Create host):
@@ -193,6 +227,37 @@ Invoke-WebRequest -Uri https://packages.wazuh.com/4.x/windows/wazuh-agent-4.9.0-
 #    - Interfaces: Agent -> IP: 192.168.83.215, Port: 10050
 
 # --- GREENBONE ---
-# Agentless přístup. Nastavení přes webové rozhraní (Scans -> Tasks):
-# 1. Kliknout na Task Wizard.
-# 2. Zadat IP adresu cíle a kliknout na "Start Scans".
+# Agentless přístup. Nastavení přes webové rozhraní (přesměrování na https://192.168.82.131:8443):
+# 1. Vytvoření Cíle (Target):
+#    - Configuration -> Targets -> Ikona dokumentu s hvězdičkou (New Target)
+#    - Name: např. "Moje infrastruktura"
+#    - Hosts: Vypsat IP adresy (192.168.83.192, 192.168.83.215, 192.168.82.131)
+#    - Port List: All IANA assigned TCP
+#    - Alive Test: Consider Alive (pokud stroje blokují klasický ping)
+#    - Uložit (Save).
+# 2. Vytvoření Úlohy (Task):
+#    - Scans -> Tasks -> Ikona s hvězdičkou (New Task)
+#    - Name: např. "Kompletní sken hostů"
+#    - Scan Targets: Z roletky vybrat vytvořený cíl "Moje infrastruktura"
+#    - Scanner: OpenVAS Default
+#    - Scan Config: Full and fast
+#    - Uložit (Save).
+# 3. Spuštění skenu:
+#    - V sekci Scans -> Tasks u nové úlohy kliknout na ikonu "Play" (Start).
+#    - Průběh a výsledky lze sledovat v záložce Scans -> Reports.
+
+==============================
+== DATABÁZE: SOC DIAGNOSTIKA ==
+==============================
+
+# 1. Kontrola aktivních hostů a OS:
+# docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT agent_id, hostname, ip_address, status FROM hosts WHERE status = 'active';"
+
+# 2. Výpis posledních 10 incidentů (Zdroj -> Cíl):
+# docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, src_ip, dst_ip, alert_level, rule_description FROM wazuh_alerts ORDER BY timestamp DESC LIMIT 10;"
+
+# 3. Statistika závažnosti incidentů v databázi:
+# docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT alert_level, COUNT(*) FROM wazuh_alerts GROUP BY alert_level ORDER BY alert_level DESC;"
+
+# 4. Tvrdý reset všech tabulek (v případě chyby struktury):
+# docker compose exec postgres-db psql -U soc_user -d soc_data -c "DROP TABLE hosts CASCADE;"
