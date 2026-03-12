@@ -96,8 +96,11 @@ docker compose up -d
 
 # --- PYTHON INTEGRACE ---
 cd ~/security/python
-# Používá SOC INTEGRATOR v2.1 pro sběr dat z Wazuhu do Postgresu
-# Zahrnuje Source IP, Destination IP a Agent ID.
+# Používá SOC INTEGRATOR v5.6 pro centrální sběr a korelaci dat do Postgresu.
+# - Wazuh: Bezpečnostní alerty (včetně identifikace zdrojové a cílové IP adresy).
+# - Zabbix: Historie metrik (CPU, RAM, Disk) a aktuální stav dostupnosti (UP/DOWN tabulka).
+# - Greenbone: Plnohodnotná tabulka zranitelností z GMP API (zpracování neomezeného počtu řádků).
+# Zahrnuje automatický Garbage Collector, který maže opravené zranitelnosti a udržuje 30denní retenci historie.
 docker compose build
 docker compose up -d
 
@@ -245,19 +248,35 @@ Invoke-WebRequest -Uri https://packages.wazuh.com/4.x/windows/wazuh-agent-4.9.0-
 # 3. Spuštění skenu:
 #    - V sekci Scans -> Tasks u nové úlohy kliknout na ikonu "Play" (Start).
 #    - Průběh a výsledky lze sledovat v záložce Scans -> Reports.
+# 4. Autentizovaný (Credentialed) sken pro hlubší analýzu zranitelností OS:
+#    - Configuration -> Credentials -> Ikona (New Credential). Zadat jméno a heslo pro SSH přístup k serveru.
+#    - Configuration -> Targets -> Upravit příslušný cíl (ikona tužky).
+#    - V sekci "Credentials for authenticated checks" -> "SSH" vybrat vytvořené pověření.
+#    - Znovu spustit úlohu (Task). Sken zachytí desítky až stovky lokálních zranitelností (CVE), které nejsou zvenčí vidět.
 
 ==============================
 == DATABÁZE: SOC DIAGNOSTIKA ==
 ==============================
 
-# 1. Kontrola aktivních hostů a OS:
-# docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT agent_id, hostname, ip_address, status FROM hosts WHERE status = 'active';"
+# Tyto příkazy slouží pro rychlé ověření, že integrátor (Python skript) správně zpracovává a ukládá data z API do Postgresu.
 
-# 2. Výpis posledních 10 incidentů (Zdroj -> Cíl):
-# docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, src_ip, dst_ip, alert_level, rule_description FROM wazuh_alerts ORDER BY timestamp DESC LIMIT 10;"
+# 1. Kontrola aktivních hostů a OS (Základní identifikace napříč systémy):
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT agent_id, ip_address, hostname, os_name, status FROM hosts;"
 
-# 3. Statistika závažnosti incidentů v databázi:
-# docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT alert_level, COUNT(*) FROM wazuh_alerts GROUP BY alert_level ORDER BY alert_level DESC;"
+# 2. Wazuh - Výpis posledních 5 bezpečnostních incidentů (Zdroj -> Cíl):
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, src_ip, dst_ip, alert_level, SUBSTRING(rule_description, 1, 50) AS rule_desc FROM wazuh_alerts ORDER BY timestamp DESC LIMIT 5;"
 
-# 4. Tvrdý reset všech tabulek (v případě chyby struktury):
-# docker compose exec postgres-db psql -U soc_user -d soc_data -c "DROP TABLE hosts CASCADE;"
+# 3. Wazuh - Statistika závažnosti incidentů v databázi:
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT alert_level, COUNT(*) FROM wazuh_alerts GROUP BY alert_level ORDER BY alert_level DESC;"
+
+# 4. Zabbix Current - Semafor aktuálního stavu a využití prostředků (UP/DOWN):
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_address, status, cpu_usage, ram_usage, disk_usage, uptime_sec FROM zabbix_current;"
+
+# 5. Zabbix History - Kontrola zápisu časové řady (Time-series data pro grafy):
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, ip_address, status, cpu_usage, ram_usage FROM zabbix_history ORDER BY timestamp DESC LIMIT 6;"
+
+# 6. Greenbone - Výpis TOP 15 nejzávažnějších zranitelností z posledního skenu:
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_address, threat_level, cvss, port, SUBSTRING(nvt_name, 1, 50) AS nvt_short FROM greenbone_vulns ORDER BY cvss DESC LIMIT 15;"
+
+# 7. Tvrdý reset všech tabulek (v případě změny relační struktury):
+# docker compose exec postgres-db psql -U soc_user -d soc_data -c "DROP TABLE hosts, wazuh_alerts, zabbix_current, zabbix_history, greenbone_vulns CASCADE;"
