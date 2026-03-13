@@ -56,7 +56,7 @@ def get_db_connection():
             time.sleep(5)
 
 def init_db():
-    log(f"Inicializace tabulek (v5.6 - Retention: {RETENTION_DAYS} dni)...")
+    log(f"Inicializace tabulek (v5.7.1 - OS Field Fix)...")
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -84,6 +84,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS zabbix_current (
                 ip_address VARCHAR(45) PRIMARY KEY,
                 status VARCHAR(10),
+                os_info VARCHAR(255),
                 cpu_usage FLOAT,
                 ram_usage FLOAT,
                 disk_usage FLOAT,
@@ -94,6 +95,7 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 ip_address VARCHAR(45),
                 status VARCHAR(10),
+                os_info VARCHAR(255),
                 cpu_usage FLOAT,
                 ram_usage FLOAT,
                 disk_usage FLOAT,
@@ -112,6 +114,8 @@ def init_db():
                 UNIQUE(ip_address, nvt_name, port)
             );
         """)
+        cur.execute("ALTER TABLE zabbix_current ADD COLUMN IF NOT EXISTS os_info VARCHAR(255);")
+        cur.execute("ALTER TABLE zabbix_history ADD COLUMN IF NOT EXISTS os_info VARCHAR(255);")
         conn.commit()
     except Exception as e:
         log(f"CHYBA DB INIT: {e}")
@@ -196,10 +200,15 @@ def fetch_zabbix_data(conn):
             'Authorization': f'Bearer {ZABBIX_API_TOKEN}'
         }
         
+        # Rozsireny dotaz na inventory (vice poli pro OS)
         payload_hosts = {
             "jsonrpc": "2.0",
             "method": "host.get",
-            "params": {"output": ["hostid", "name"], "selectInterfaces": ["ip", "available"]},
+            "params": {
+                "output": ["hostid", "name"], 
+                "selectInterfaces": ["ip", "available"], 
+                "selectInventory": ["os", "os_full", "software"]
+            },
             "id": 1
         }
         
@@ -211,6 +220,12 @@ def fetch_zabbix_data(conn):
             hostid = host['hostid']
             interfaces = host.get('interfaces', [])
             if not interfaces: continue
+            
+            # Agresivni sber OS info - zkusi vsechna pole
+            inventory = host.get('inventory')
+            os_info = 'N/A'
+            if inventory:
+                os_info = inventory.get('os') or inventory.get('os_full') or inventory.get('software') or 'N/A'
             
             host_ip = interfaces[0].get('ip')
             if host_ip == '127.0.0.1': host_ip = DOCKER_SERVER_IP
@@ -266,30 +281,29 @@ def fetch_zabbix_data(conn):
                             val = float(hist_data[0]['value'])
                             clock = int(hist_data[0]['clock'])
                             if clock > latest_clock: latest_clock = clock
-                                
                             metrics[target_metric] = round(val, 2) if target_metric != 'uptime_sec' else int(val)
                             found_any = True
-                        except ValueError:
+                        except (ValueError, KeyError):
                             pass
             
             if not found_any and host_status == "UNKNOWN":
                 continue
 
             cur.execute("""
-                INSERT INTO zabbix_current (ip_address, status, cpu_usage, ram_usage, disk_usage, uptime_sec)
-                VALUES (%s, %s, %s, %s, %s, %s) 
+                INSERT INTO zabbix_current (ip_address, status, os_info, cpu_usage, ram_usage, disk_usage, uptime_sec)
+                VALUES (%s, %s, %s, %s, %s, %s, %s) 
                 ON CONFLICT (ip_address) 
-                DO UPDATE SET status = EXCLUDED.status, cpu_usage = EXCLUDED.cpu_usage, 
+                DO UPDATE SET status = EXCLUDED.status, os_info = EXCLUDED.os_info, cpu_usage = EXCLUDED.cpu_usage, 
                               ram_usage = EXCLUDED.ram_usage, disk_usage = EXCLUDED.disk_usage, 
                               uptime_sec = EXCLUDED.uptime_sec, last_update = CURRENT_TIMESTAMP
-            """, (host_ip, host_status, metrics['cpu_usage'], metrics['ram_usage'], metrics['disk_usage'], metrics['uptime_sec']))
+            """, (host_ip, host_status, os_info, metrics['cpu_usage'], metrics['ram_usage'], metrics['disk_usage'], metrics['uptime_sec']))
 
             if found_any and latest_clock > 0:
                 metric_timestamp = datetime.fromtimestamp(latest_clock).strftime('%Y-%m-%d %H:%M:%S')
                 cur.execute("""
-                    INSERT INTO zabbix_history (ip_address, status, cpu_usage, ram_usage, disk_usage, uptime_sec, timestamp)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (ip_address, timestamp) DO NOTHING
-                """, (host_ip, host_status, metrics['cpu_usage'], metrics['ram_usage'], metrics['disk_usage'], metrics['uptime_sec'], metric_timestamp))
+                    INSERT INTO zabbix_history (ip_address, status, os_info, cpu_usage, ram_usage, disk_usage, uptime_sec, timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (ip_address, timestamp) DO NOTHING
+                """, (host_ip, host_status, os_info, metrics['cpu_usage'], metrics['ram_usage'], metrics['disk_usage'], metrics['uptime_sec'], metric_timestamp))
                 
                 if cur.rowcount > 0:
                     metrics_count += 1
@@ -304,9 +318,7 @@ def fetch_zabbix_data(conn):
 def fetch_greenbone_data(conn):
     try:
         cur = conn.cursor()
-        
         fetch_start_time = datetime.now()
-        
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(15)
         s.connect((GREENBONE_HOST, GREENBONE_PORT))
@@ -321,7 +333,7 @@ def fetch_greenbone_data(conn):
             auth_resp += chunk
             
         if b'status="200"' not in auth_resp:
-            log("Greenbone Auth Error: Zkontroluj heslo nebo proxy.")
+            log("Greenbone Auth Error: Zkontroluj heslo.")
             s.close()
             return
             
@@ -335,7 +347,6 @@ def fetch_greenbone_data(conn):
             vuln_resp += chunk
             
         s.close()
-        
         root = ET.fromstring(vuln_resp.decode('utf-8', errors='ignore'))
         vuln_count = 0
         
@@ -345,7 +356,6 @@ def fetch_greenbone_data(conn):
             
             threat = result.findtext('threat', default='Unknown')
             port = result.findtext('port', default='general/tcp')
-            
             nvt = result.find('nvt')
             nvt_name = nvt.findtext('name', default='Unknown NVT') if nvt is not None else 'Unknown NVT'
             cvss = nvt.findtext('cvss_base', default='0.0') if nvt is not None else '0.0'
@@ -362,20 +372,18 @@ def fetch_greenbone_data(conn):
                 ON CONFLICT (ip_address, nvt_name, port) 
                 DO UPDATE SET threat_level = EXCLUDED.threat_level, cvss = EXCLUDED.cvss, timestamp = CURRENT_TIMESTAMP
             """, (host, nvt_name, threat, cvss_val, port))
-            
             vuln_count += 1
             
         cur.execute("DELETE FROM greenbone_vulns WHERE timestamp < %s", (fetch_start_time,))
         deleted_count = cur.rowcount
-            
         conn.commit()
         cur.close()
-        log(f"Greenbone OK. Zpracovano: {vuln_count} | Odstraneno opravenych: {deleted_count}")
+        log(f"Greenbone OK. Zpracovano: {vuln_count} | Odstraneno: {deleted_count}")
         
     except socket.timeout:
-        log("CHYBA Greenbone sberu: Casovy limit spojeni vyprsel (Proxy nedostupna?)")
+        log("CHYBA Greenbone sberu: Casovy limit vyprsel.")
     except ET.ParseError:
-        log("CHYBA Greenbone sberu: Spatny format XML ze serveru.")
+        log("CHYBA Greenbone sberu: Spatne XML.")
     except Exception as e:
         log(f"CHYBA Greenbone sberu: {e}")
 
@@ -383,24 +391,19 @@ def cleanup_old_data(conn):
     try:
         cur = conn.cursor()
         cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
-        
         cur.execute("DELETE FROM wazuh_alerts WHERE timestamp < %s", (cutoff_date,))
         wazuh_deleted = cur.rowcount
-        
         cur.execute("DELETE FROM zabbix_history WHERE timestamp < %s", (cutoff_date,))
         zabbix_deleted = cur.rowcount
-        
         conn.commit()
         cur.close()
-        
         if wazuh_deleted > 0 or zabbix_deleted > 0:
-            log(f"RETENCE OK. Smazano starych zaznamu: Wazuh ({wazuh_deleted}), Zabbix ({zabbix_deleted})")
-            
+            log(f"RETENCE OK. Smazano: Wazuh ({wazuh_deleted}), Zabbix ({zabbix_deleted})")
     except Exception as e:
-        log(f"CHYBA Retence dat: {e}")
+        log(f"CHYBA Retence: {e}")
 
 if __name__ == "__main__":
-    log("=== SOC INTEGRATOR v5.6 STARTUJE ===")
+    log("=== SOC INTEGRATOR v5.7.1 STARTUJE ===")
     init_db()
     while True:
         db_conn = get_db_connection()
@@ -408,6 +411,6 @@ if __name__ == "__main__":
             fetch_wazuh_data(db_conn)
             fetch_zabbix_data(db_conn)
             fetch_greenbone_data(db_conn)
-            cleanup_old_data(db_conn)  # Spuštění úklidu na konci každého cyklu
+            cleanup_old_data(db_conn)
             db_conn.close()
         time.sleep(60)

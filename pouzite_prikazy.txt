@@ -12,6 +12,7 @@
 | Grafana         | http://192.168.82.131:3000     | admin            | admin              |
 | Greenbone (GSA) | https://192.168.82.131:8443/   | admin            | admin              |
 | Postgres DB     | (uvnitř soc-network)           | soc_user         | SecurityPassword123|
+| Windows Host    | RDP / Local                    | student          | vlaceKK-87         |
 ========================================================================================
 * Upozornění pro Greenbone: Heslo bude platné až po spuštění příkazu pro jeho vytvoření
   (docker compose exec -u gvmd gvmd gvmd --user=admin --new-password=admin),
@@ -96,12 +97,12 @@ docker compose up -d
 
 # --- PYTHON INTEGRACE ---
 cd ~/security/python
-# Používá SOC INTEGRATOR v5.6 pro centrální sběr a korelaci dat do Postgresu.
-# - Wazuh: Bezpečnostní alerty (včetně identifikace zdrojové a cílové IP adresy).
-# - Zabbix: Historie metrik (CPU, RAM, Disk) a aktuální stav dostupnosti (UP/DOWN tabulka).
-# - Greenbone: Plnohodnotná tabulka zranitelností z GMP API (zpracování neomezeného počtu řádků).
-# Zahrnuje automatický Garbage Collector, který maže opravené zranitelnosti a udržuje 30denní retenci historie.
-docker compose build
+# Používá SOC INTEGRATOR v5.7.1 pro centrální sběr a korelaci dat do Postgresu.
+# - Wazuh: Bezpečnostní alerty a automatická registrace hostů.
+# - Zabbix: Sběr metrik + OS Info z Host Inventory (Pole: os, os_full, software).
+# - Greenbone: Plnohodnotná tabulka zranitelností z GMP API.
+# - Retention: 30denní automatické promazávání historie.
+docker compose build --no-cache
 docker compose up -d
 
 ==============================
@@ -116,7 +117,7 @@ curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | sudo gpg --no-default-key
 echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" | sudo tee -a /etc/apt/sources.list.d/wazuh.list
 sudo apt-get update
 sudo WAZUH_MANAGER="127.0.0.1" apt-get install wazuh-agent=4.9.0-1 -y
-sudo usermod -aG adm wazuh  # Nutné pro čtení auth.log
+sudo usermod -aG adm wazuh
 sudo systemctl daemon-reload
 sudo systemctl enable wazuh-agent
 sudo systemctl start wazuh-agent
@@ -128,19 +129,10 @@ wget https://repo.zabbix.com/zabbix/6.4/ubuntu/pool/main/z/zabbix-release/zabbix
 sudo dpkg -i zabbix-release_6.4-1+ubuntu22.04_all.deb
 sudo apt update
 sudo apt install zabbix-agent2 -y
-
-sudo ufw allow 10050/tcp
 openssl rand -hex 32 | sudo tee /etc/zabbix/zabbix_agent2_docker.psk
 sudo chown zabbix:zabbix /etc/zabbix/zabbix_agent2_docker.psk
 sudo chmod 640 /etc/zabbix/zabbix_agent2_docker.psk
-
-sudo sed -i 's/Server=127.0.0.1/Server=127.0.0.1,192.168.82.131,172.16.0.0\/12/g' /etc/zabbix/zabbix_agent2.conf
-sudo sed -i 's/ServerActive=127.0.0.1/ServerActive=127.0.0.1/g' /etc/zabbix/zabbix_agent2.conf
-sudo sed -i 's/Hostname=Zabbix server/Hostname=Docker-Server/g' /etc/zabbix/zabbix_agent2.conf
-echo -e "\nTLSConnect=psk\nTLSAccept=psk\nTLSPSKIdentity=PSK-Docker\nTLSPSKFile=/etc/zabbix/zabbix_agent2_docker.psk" | sudo tee -a /etc/zabbix/zabbix_agent2.conf
-
-sudo systemctl restart zabbix-agent2
-sudo systemctl enable zabbix-agent2
+# Konfigurace PSK v /etc/zabbix/zabbix_agent2.conf: TLSPSKIdentity=PSK-Docker
 
 ==============================
 ========= LINUX HOST =========
@@ -150,35 +142,14 @@ sudo systemctl enable zabbix-agent2
 # ---------------------------------------------
 # 1. WAZUH AGENT
 # ---------------------------------------------
-curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | sudo gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import && sudo chmod 644 /usr/share/keyrings/wazuh.gpg
-echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" | sudo tee -a /etc/apt/sources.list.d/wazuh.list
-sudo apt-get update
 sudo WAZUH_MANAGER="192.168.82.131" apt-get install wazuh-agent=4.9.0-1 -y
-sudo usermod -aG adm wazuh  # Nutné pro čtení auth.log
-sudo systemctl daemon-reload
 sudo systemctl enable wazuh-agent
 sudo systemctl start wazuh-agent
 
 # ---------------------------------------------
 # 2. ZABBIX AGENT 2 (Šifrováno PSK)
 # ---------------------------------------------
-wget https://repo.zabbix.com/zabbix/6.4/ubuntu/pool/main/z/zabbix-release/zabbix-release_6.4-1+ubuntu22.04_all.deb
-sudo dpkg -i zabbix-release_6.4-1+ubuntu22.04_all.deb
-sudo apt update
-sudo apt install zabbix-agent2 -y
-
-sudo ufw allow 10050/tcp
-openssl rand -hex 32 | sudo tee /etc/zabbix/zabbix_agent2.psk
-sudo chown zabbix:zabbix /etc/zabbix/zabbix_agent2.psk
-sudo chmod 640 /etc/zabbix/zabbix_agent2.psk
-
-sudo sed -i 's/Server=127.0.0.1/Server=192.168.82.131/g' /etc/zabbix/zabbix_agent2.conf
-sudo sed -i 's/ServerActive=127.0.0.1/ServerActive=192.168.82.131/g' /etc/zabbix/zabbix_agent2.conf
-sudo sed -i 's/Hostname=Zabbix server/Hostname=Ubuntu-Host/g' /etc/zabbix/zabbix_agent2.conf
-echo -e "\nTLSConnect=psk\nTLSAccept=psk\nTLSPSKIdentity=PSK-Ubuntu\nTLSPSKFile=/etc/zabbix/zabbix_agent2.psk" | sudo tee -a /etc/zabbix/zabbix_agent2.conf
-
-sudo systemctl restart zabbix-agent2
-sudo systemctl enable zabbix-agent2
+# PSK Identity: PSK-Ubuntu
 
 ==============================
 ======== WINDOWS HOST ========
@@ -188,95 +159,43 @@ sudo systemctl enable zabbix-agent2
 # ---------------------------------------------
 # 1. WAZUH AGENT
 # ---------------------------------------------
-# Spustit PowerShell jako Správce:
-Invoke-WebRequest -Uri https://packages.wazuh.com/4.x/windows/wazuh-agent-4.9.0-1.msi -OutFile ${env:tmp}\wazuh-agent.msi; msiexec.exe /i ${env:tmp}\wazuh-agent.msi /q WAZUH_MANAGER="192.168.82.131" WAZUH_REGISTRATION_SERVER="192.168.82.131"; NET START WazuhSvc
+# PowerShell (Admin):
+Invoke-WebRequest -Uri https://packages.wazuh.com/4.x/windows/wazuh-agent-4.9.0-1.msi -OutFile ${env:tmp}\wazuh-agent.msi
+Start-Process msiexec.exe -ArgumentList "/i ${env:tmp}\wazuh-agent.msi /q WAZUH_MANAGER='192.168.82.131' WAZUH_REGISTRATION_SERVER='192.168.82.131'" -Wait
+Start-Service -Name Wazuh
 
 # ---------------------------------------------
-# 2. ZABBIX AGENT 2
+# 2. ZABBIX AGENT 2 (Šifrováno PSK)
 # ---------------------------------------------
-# 1. Stáhnout MSI instalátor z webu Zabbixu.
-# 2. Vyplnit: Host name (Windows10-Host), Server IP (192.168.82.131), Server active IP (192.168.82.131).
+# 1. Instalace MSI (Identity: PSK-Windows, PSK: vygenerovaný hex)
+# 2. Povolit příchozí port 10050 ve Windows Firewall.
 
 ==============================
 === PŘIDÁNÍ DAT DO SYSTÉMŮ ===
 ==============================
 
-# --- WAZUH ---
-# Agenti se po instalaci registrují automaticky.
-# Nutno aktivovat zranitelnosti a FIM:
-# 1. Management -> Configuration -> Edit configuration
-# 2. Zapnout <vulnerability-detector> na <enabled>yes</enabled> a u daných OS (Ubuntu, Windows) také yes.
-# 3. Zkontrolovat zapnutí modulu syscheck (Integrity monitoring).
-# 4. Uložit a restartovat managera.
-# Pro vynucení okamžitých alertů lze na klientovi restartovat agenta a zkusit se 6-8x přihlásit se špatným heslem.
-
-# --- ZABBIX ---
-# Nutno přidat manuálně přes web (Data collection -> Hosts -> Create host):
-# 1. Ubuntu (Šifrováno PSK): 
-#    - Host name: Ubuntu-Host
-#    - Templates: Linux by Zabbix agent
-#    - Host groups: Linux servers
-#    - Interfaces: Agent -> IP: 192.168.83.192, Port: 10050
-#    - Encryption: PSK (Connections to/from), Identity: PSK-Ubuntu, vložit vygenerovaný klíč.
-# 2. Docker-Server (Šifrováno PSK):
-#    - Host name: Docker-Server
-#    - Templates: Linux by Zabbix agent
-#    - Host groups: Linux servers
-#    - Interfaces: Agent -> IP: 192.168.82.131, Port: 10050
-#    - Encryption: PSK (Connections to/from), Identity: PSK-Docker, vložit vygenerovaný klíč.
-# 3. Windows:
-#    - Host name: Windows10-Host
-#    - Templates: Windows by Zabbix agent
-#    - Interfaces: Agent -> IP: 192.168.83.215, Port: 10050
+# --- ZABBIX (Důležité pro OS Info) ---
+# Pro každý Host (Docker-Server, Ubuntu-Host, Windows10-Host):
+# 1. Data collection -> Hosts -> Kliknout na Host.
+# 2. Záložka Inventory -> Zvolit "Automatic".
+# 3. Kliknout na Update.
 
 # --- GREENBONE ---
-# Agentless přístup. Nastavení přes webové rozhraní (přesměrování na https://192.168.82.131:8443):
-# 1. Vytvoření Cíle (Target):
-#    - Configuration -> Targets -> Ikona dokumentu s hvězdičkou (New Target)
-#    - Name: např. "Moje infrastruktura"
-#    - Hosts: Vypsat IP adresy (192.168.83.192, 192.168.83.215, 192.168.82.131)
-#    - Port List: All IANA assigned TCP
-#    - Alive Test: Consider Alive (pokud stroje blokují klasický ping)
-#    - Uložit (Save).
-# 2. Vytvoření Úlohy (Task):
-#    - Scans -> Tasks -> Ikona s hvězdičkou (New Task)
-#    - Name: např. "Kompletní sken hostů"
-#    - Scan Targets: Z roletky vybrat vytvořený cíl "Moje infrastruktura"
-#    - Scanner: OpenVAS Default
-#    - Scan Config: Full and fast
-#    - Uložit (Save).
-# 3. Spuštění skenu:
-#    - V sekci Scans -> Tasks u nové úlohy kliknout na ikonu "Play" (Start).
-#    - Průběh a výsledky lze sledovat v záložce Scans -> Reports.
-# 4. Autentizovaný (Credentialed) sken pro hlubší analýzu zranitelností OS:
-#    - Configuration -> Credentials -> Ikona (New Credential). Zadat jméno a heslo pro SSH přístup k serveru.
-#    - Configuration -> Targets -> Upravit příslušný cíl (ikona tužky).
-#    - V sekci "Credentials for authenticated checks" -> "SSH" vybrat vytvořené pověření.
-#    - Znovu spustit úlohu (Task). Sken zachytí desítky až stovky lokálních zranitelností (CVE), které nejsou zvenčí vidět.
+# Configuration -> Targets -> Edit "Moje infrastruktura"
+# Přidat IP do seznamu: 192.168.83.192, 192.168.83.215, 192.168.82.131
 
 ==============================
 == DATABÁZE: SOC DIAGNOSTIKA ==
 ==============================
 
-# Tyto příkazy slouží pro rychlé ověření, že integrátor (Python skript) správně zpracovává a ukládá data z API do Postgresu.
+# 1. Kompletní přehled hostů včetně OS Info ze Zabbixu:
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_address, status, SUBSTRING(os_info, 1, 50) AS os, cpu_usage, ram_usage FROM zabbix_current;"
 
-# 1. Kontrola aktivních hostů a OS (Základní identifikace napříč systémy):
-docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT agent_id, ip_address, hostname, os_name, status FROM hosts;"
+# 2. Přehled hostů detekovaných Wazuhem:
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT agent_id, hostname, os_name, status FROM hosts;"
 
-# 2. Wazuh - Výpis posledních 5 bezpečnostních incidentů (Zdroj -> Cíl):
-docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, src_ip, dst_ip, alert_level, SUBSTRING(rule_description, 1, 50) AS rule_desc FROM wazuh_alerts ORDER BY timestamp DESC LIMIT 5;"
+# 3. Výpis TOP 10 zranitelností (včetně nového Windows hosta):
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_address, cvss, port, SUBSTRING(nvt_name, 1, 60) FROM greenbone_vulns ORDER BY cvss DESC LIMIT 10;"
 
-# 3. Wazuh - Statistika závažnosti incidentů v databázi:
-docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT alert_level, COUNT(*) FROM wazuh_alerts GROUP BY alert_level ORDER BY alert_level DESC;"
-
-# 4. Zabbix Current - Semafor aktuálního stavu a využití prostředků (UP/DOWN):
-docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_address, status, cpu_usage, ram_usage, disk_usage, uptime_sec FROM zabbix_current;"
-
-# 5. Zabbix History - Kontrola zápisu časové řady (Time-series data pro grafy):
-docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, ip_address, status, cpu_usage, ram_usage FROM zabbix_history ORDER BY timestamp DESC LIMIT 6;"
-
-# 6. Greenbone - Výpis TOP 15 nejzávažnějších zranitelností z posledního skenu:
-docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_address, threat_level, cvss, port, SUBSTRING(nvt_name, 1, 50) AS nvt_short FROM greenbone_vulns ORDER BY cvss DESC LIMIT 15;"
-
-# 7. Tvrdý reset všech tabulek (v případě změny relační struktury):
-# docker compose exec postgres-db psql -U soc_user -d soc_data -c "DROP TABLE hosts, wazuh_alerts, zabbix_current, zabbix_history, greenbone_vulns CASCADE;"
+# 4. Poslední kritické security alerty (Level 10+):
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, src_ip, dst_ip, alert_level, rule_description FROM wazuh_alerts WHERE alert_level >= 10 ORDER BY timestamp DESC LIMIT 5;"
