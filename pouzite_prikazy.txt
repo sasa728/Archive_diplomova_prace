@@ -2,18 +2,18 @@
 ======== CREDENTIALS ========
 =============================
 
-========================================================================================
-| Nástroj         | URL adresa                     | Jméno            | Heslo              |
-========================================================================================
-| Wazuh Dashboard | https://192.168.82.131         | admin            | SecretPassword     |
-| Wazuh Indexer   | https://192.168.82.131:9200    | admin            | SecretPassword     |
-| Wazuh Manager   | https://192.168.82.131:55000   | wazuh-wui        | MyS3cr37P450r.*-   |
-| Zabbix Web      | http://192.168.82.131:8080     | Admin (velké A!) | zabbix             |
-| Grafana         | http://192.168.82.131:3000     | admin            | admin              |
-| Greenbone (GSA) | https://192.168.82.131:8443/   | admin            | admin              |
-| Postgres DB     | (uvnitř soc-network)           | soc_user         | SecurityPassword123|
-| Windows Host    | RDP / Local                    | student          | vlaceKK-87         |
-========================================================================================
+===============================================================================================================
+| Nástroj         | URL adresa (Interní)           | DNS adresa (Nginx HTTPS)    | Jméno            | Heslo              |
+===============================================================================================================
+| Wazuh Dashboard | https://192.168.82.131:4443    | https://wazuh.soc.local     | admin            | SecretPassword     |
+| Wazuh Indexer   | https://192.168.82.131:9200    | -                           | admin            | SecretPassword     |
+| Wazuh Manager   | https://192.168.82.131:55000   | -                           | wazuh-wui        | MyS3cr37P450r.*-   |
+| Zabbix Web      | http://192.168.82.131:8080     | https://zabbix.soc.local    | Admin (velké A!) | zabbix             |
+| Grafana         | http://192.168.82.131:3000     | https://grafana.soc.local   | admin            | admin              |
+| Greenbone (GSA) | https://192.168.82.131:8443/   | https://greenbone.soc.local | admin            | admin              |
+| Postgres DB     | (uvnitř soc-network)           | -                           | soc_user         | SecurityPassword123|
+| Windows Host    | RDP / Local                    | -                           | student          | vlaceKK-87         |
+===============================================================================================================
 * Upozornění pro Greenbone: Heslo bude platné až po spuštění příkazu pro jeho vytvoření
   (docker compose exec -u gvmd gvmd gvmd --user=admin --new-password=admin),
   který lze spustit až po kompletním dokončení úvodní inicializace databáze.
@@ -37,7 +37,7 @@ newgrp docker
 # 2. Vytvoření síťové infrastruktury a složek
 docker network create soc-network
 cd ~
-mkdir -p security/{wazuh,zabbix,greenbone,grafana,python}
+mkdir -p security/{wazuh,zabbix,greenbone,grafana,python,nginx/certs}
 
 # ---------------------------------------------
 # 3. NASAZENÍ APLIKACÍ
@@ -58,7 +58,7 @@ docker compose up -d
 cd ~/security/wazuh
 git clone https://github.com/wazuh/wazuh-docker.git -b v4.9.0 .
 cd single-node
-# V docker-compose.yml vystaveny porty: 1514, 1515, 514/udp, 55000
+# V docker-compose.yml vystaveny porty: 1514, 1515, 514/udp, 55000 a 4443:5601 (uvolněn port 443 pro Nginx)
 docker compose -f generate-indexer-certs.yml run --rm generator
 docker compose up -d
 
@@ -90,7 +90,7 @@ docker compose up -d
 # --- GREENBONE ---
 cd ~/security/greenbone
 # (Zde byl stažen oficiální compose.yaml z dokumentace.
-# Port pro webové rozhraní (NGINX) byl změněn z 443 na 8443, aby nekolidoval s Wazuhem.
+# Port pro webové rozhraní (NGINX) byl změněn z 443 na 8443, aby nekolidoval s Wazuhem/Nginx proxy.
 # Na konec souboru byla přidána služba gmp-proxy pro zpřístupnění API na portu 9390.)
 docker compose pull
 docker compose up -d
@@ -103,6 +103,15 @@ cd ~/security/python
 # - Greenbone: Plnohodnotná tabulka zranitelností z GMP API.
 # - Retention: 30denní automatické promazávání historie.
 docker compose build --no-cache
+docker compose up -d
+
+# --- NGINX REVERSE PROXY ---
+cd ~/security/nginx/certs
+# Generování self-signed certifikátu pro *.soc.local
+openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout soc.local.key -out soc.local.crt -subj "/C=CZ/ST=Czechia/L=Prague/O=SOC Lab/CN=*.soc.local"
+cd ~/security/nginx
+# V docker-compose.yml připojeny sítě: soc-network, single-node_default, greenbone-community-edition_default
+# Nginx směruje provoz z portů 80/443 na interní kontejnery podle DNS názvu.
 docker compose up -d
 
 ==============================
@@ -183,6 +192,16 @@ Start-Service -Name Wazuh
 # --- GREENBONE ---
 # Configuration -> Targets -> Edit "Moje infrastruktura"
 # Přidat IP do seznamu: 192.168.83.192, 192.168.83.215, 192.168.82.131
+
+# --- NASTAVENÍ LOKÁLNÍHO DNS (Pro přístup přes domény) ---
+# Klientské PC (macOS / Linux):
+# sudo nano /etc/hosts
+#
+# Klientské PC (Windows):
+# Notepad jako Správce -> C:\Windows\System32\drivers\etc\hosts
+#
+# Vložit řádky:
+# 192.168.82.131 zabbix.soc.local wazuh.soc.local grafana.soc.local greenbone.soc.local
 
 ==============================
 == DATABÁZE: SOC DIAGNOSTIKA ==
