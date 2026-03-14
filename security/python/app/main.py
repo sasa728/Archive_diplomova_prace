@@ -56,7 +56,7 @@ def get_db_connection():
             time.sleep(5)
 
 def init_db():
-    log(f"Inicializace tabulek (v5.8.0 - Pridano MITRE a CTI)...")
+    log(f"Inicializace tabulek (v5.9.0 - Pridano MITRE, CTI a CVE)...")
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -79,7 +79,7 @@ def init_db():
                 alert_level INTEGER,
                 rule_description TEXT,
                 mitre_tactic VARCHAR(100),
-                mitre_technique VARCHAR(100), -- PŘIDÁNO
+                mitre_technique VARCHAR(100),
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS zabbix_current (
@@ -111,13 +111,15 @@ def init_db():
                 threat_level VARCHAR(100),
                 cvss FLOAT,
                 port VARCHAR(100),
+                cve TEXT, -- PŘIDÁNO
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(ip_address, nvt_name, port)
             );
         """)
         cur.execute("ALTER TABLE zabbix_current ADD COLUMN IF NOT EXISTS os_info VARCHAR(255);")
         cur.execute("ALTER TABLE zabbix_history ADD COLUMN IF NOT EXISTS os_info VARCHAR(255);")
-        cur.execute("ALTER TABLE wazuh_alerts ADD COLUMN IF NOT EXISTS mitre_technique VARCHAR(100);") # PŘIDÁNO
+        cur.execute("ALTER TABLE wazuh_alerts ADD COLUMN IF NOT EXISTS mitre_technique VARCHAR(100);")
+        cur.execute("ALTER TABLE greenbone_vulns ADD COLUMN IF NOT EXISTS cve TEXT;") # PŘIDÁNO
         conn.commit()
     except Exception as e:
         log(f"CHYBA DB INIT: {e}")
@@ -187,7 +189,7 @@ def fetch_wazuh_data(conn):
                 INSERT INTO wazuh_alerts (wazuh_id, agent_id, src_ip, dst_ip, alert_level, rule_description, mitre_tactic, mitre_technique)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (wazuh_id) DO NOTHING
             """, (hit.get('_id'), agent.get('id'), src_ip, dst_ip, rule.get('level'), 
-                  rule.get('description'), mitre_tactic, mitre_technique)) # PŘIDÁNO mitre_technique
+                  rule.get('description'), mitre_tactic, mitre_technique))
             
             if cur.rowcount > 0: new_alerts += 1
 
@@ -364,6 +366,13 @@ def fetch_greenbone_data(conn):
             nvt_name = nvt.findtext('name', default='Unknown NVT') if nvt is not None else 'Unknown NVT'
             cvss = nvt.findtext('cvss_base', default='0.0') if nvt is not None else '0.0'
             
+            # --- PŘIDÁNO: Vytěžení CVE ID ---
+            cve_id = "N/A"
+            if nvt is not None:
+                refs = nvt.findall(".//ref[@type='cve']")
+                if refs:
+                    cve_id = ", ".join([r.get('id') for r in refs])
+
             try: cvss_val = float(cvss)
             except ValueError: cvss_val = 0.0
 
@@ -371,11 +380,11 @@ def fetch_greenbone_data(conn):
                 continue
 
             cur.execute("""
-                INSERT INTO greenbone_vulns (ip_address, nvt_name, threat_level, cvss, port)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO greenbone_vulns (ip_address, nvt_name, threat_level, cvss, port, cve)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (ip_address, nvt_name, port) 
-                DO UPDATE SET threat_level = EXCLUDED.threat_level, cvss = EXCLUDED.cvss, timestamp = CURRENT_TIMESTAMP
-            """, (host, nvt_name, threat, cvss_val, port))
+                DO UPDATE SET threat_level = EXCLUDED.threat_level, cvss = EXCLUDED.cvss, cve = EXCLUDED.cve, timestamp = CURRENT_TIMESTAMP
+            """, (host, nvt_name, threat, cvss_val, port, cve_id))
             vuln_count += 1
             
         cur.execute("DELETE FROM greenbone_vulns WHERE timestamp < %s", (fetch_start_time,))
@@ -407,7 +416,7 @@ def cleanup_old_data(conn):
         log(f"CHYBA Retence: {e}")
 
 if __name__ == "__main__":
-    log("=== SOC INTEGRATOR v5.8.0 STARTUJE ===")
+    log("=== SOC INTEGRATOR v5.9.0 STARTUJE ===")
     init_db()
     while True:
         db_conn = get_db_connection()

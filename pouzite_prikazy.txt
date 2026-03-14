@@ -3,16 +3,16 @@
 =============================
 
 ===============================================================================================================
-| Nástroj         | URL adresa (Interní)           | DNS adresa (Nginx HTTPS)    | Jméno            | Heslo              |
+| Nástroj          | URL adresa (Interní)           | DNS adresa (Nginx HTTPS)    | Jméno            | Heslo               |
 ===============================================================================================================
-| Wazuh Dashboard | https://192.168.82.131:4443    | https://wazuh.soc.local     | admin            | SecretPassword     |
-| Wazuh Indexer   | https://192.168.82.131:9200    | -                           | admin            | SecretPassword     |
+| Wazuh Dashboard | https://192.168.82.131:4443    | https://wazuh.soc.local     | admin            | SecretPassword      |
+| Wazuh Indexer   | https://192.168.82.131:9200    | -                           | admin            | SecretPassword      |
 | Wazuh Manager   | https://192.168.82.131:55000   | -                           | wazuh-wui        | MyS3cr37P450r.*-   |
-| Zabbix Web      | http://192.168.82.131:8080     | https://zabbix.soc.local    | Admin (velké A!) | zabbix             |
-| Grafana         | http://192.168.82.131:3000     | https://grafana.soc.local   | admin            | admin              |
-| Greenbone (GSA) | https://192.168.82.131:8443/   | https://greenbone.soc.local | admin            | admin              |
+| Zabbix Web      | http://192.168.82.131:8080     | https://zabbix.soc.local    | Admin (velké A!) | zabbix              |
+| Grafana         | http://192.168.82.131:3000     | https://grafana.soc.local   | admin            | admin               |
+| Greenbone (GSA) | https://192.168.82.131:8443/   | https://greenbone.soc.local | admin            | admin               |
 | Postgres DB     | (uvnitř soc-network)           | -                           | soc_user         | SecurityPassword123|
-| Windows Host    | RDP / Local                    | -                           | student          | vlaceKK-87         |
+| Windows Host    | RDP / Local                    | -                           | student          | vlaceKK-87          |
 ===============================================================================================================
 * Upozornění pro Greenbone: Heslo bude platné až po spuštění příkazu pro jeho vytvoření
   (docker compose exec -u gvmd gvmd gvmd --user=admin --new-password=admin),
@@ -63,21 +63,43 @@ docker compose -f generate-indexer-certs.yml run --rm generator
 docker compose up -d
 
 # --- WAZUH - VLASTNÍ PRAVIDLA (local_rules.xml) ---
-# V kontejneru manageru: /var/ossec/etc/rules/local_rules.xml
+# Přidána podpora pro MITRE ATT&CK tagování (T1110 - Brute Force)
 <group name="local,syslog,sshd,">
   <rule id="5760" level="10" overwrite="yes">
     <if_sid>5700,5716</if_sid>
     <match>Failed password|Failed keyboard|authentication error</match>
     <description>sshd: authentication failed (Medium Severity)</description>
     <group>authentication_failed,soc_medium</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
   <rule id="5710" level="15" overwrite="yes">
     <if_sid>5700</if_sid>
     <match>illegal user|invalid user</match>
     <description>sshd: Attempt to login using a NON-EXISTENT user (Critical Severity)</description>
     <group>authentication_failed,invalid_login,soc_critical</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 </group>
+
+# --- WAZUH - CTI INTEGRACE (AbuseIPDB) ---
+# Oprava chybějícího integrátoru v Docker image:
+docker exec -it single-node-wazuh.manager-1 mkdir -p /var/ossec/integrations
+docker exec -it single-node-wazuh.manager-1 bash -c 'cat <<EOF > /var/ossec/integrations/abuseipdb
+#!/usr/bin/env python3
+import sys
+from wazuh.integrations import AbuseIPDB
+if __name__ == "__main__":
+    try:
+        AbuseIPDB(sys.argv).run()
+    except Exception as e:
+        sys.exit(1)
+EOF'
+docker exec -it single-node-wazuh.manager-1 chmod 750 /var/ossec/integrations/abuseipdb
+docker exec -it single-node-wazuh.manager-1 chown root:wazuh /var/ossec/integrations/abuseipdb
 
 # --- WAZUH - CENTRÁLNÍ KONFIGURACE (Management -> Groups -> Agent.conf) ---
 <agent_config>
@@ -97,11 +119,11 @@ docker compose up -d
 
 # --- PYTHON INTEGRACE ---
 cd ~/security/python
-# Používá SOC INTEGRATOR v5.7.1 pro centrální sběr a korelaci dat do Postgresu.
-# - Wazuh: Bezpečnostní alerty a automatická registrace hostů.
-# - Zabbix: Sběr metrik + OS Info z Host Inventory (Pole: os, os_full, software).
-# - Greenbone: Plnohodnotná tabulka zranitelností z GMP API.
-# - Retention: 30denní automatické promazávání historie.
+# Používá SOC INTEGRATOR v5.9.0 pro centrální sběr a korelaci dat do Postgresu.
+# - Wazuh: Sběr MITRE ATT&CK Tactic/Technique a CTI alertů.
+# - Zabbix: Sběr metrik + OS Info z Host Inventory.
+# - Greenbone: Kompletní vytěžování CVE ID z XML reportů.
+# - DB Maintenance: Automatická úprava schématu (přidání cve, mitre_technique).
 docker compose build --no-cache
 docker compose up -d
 
@@ -194,14 +216,17 @@ Start-Service -Name Wazuh
 # Přidat IP do seznamu: 192.168.83.192, 192.168.83.215, 192.168.82.131
 
 # --- NASTAVENÍ LOKÁLNÍHO DNS (Pro přístup přes domény) ---
-# Klientské PC (macOS / Linux):
-# sudo nano /etc/hosts
-#
-# Klientské PC (Windows):
-# Notepad jako Správce -> C:\Windows\System32\drivers\etc\hosts
-#
-# Vložit řádky:
 # 192.168.82.131 zabbix.soc.local wazuh.soc.local grafana.soc.local greenbone.soc.local
+
+==============================
+== GRAFANA: CTI DASHBOARDS ===
+==============================
+
+# 1. Panel: Vulnerability Intelligence Feed (CVE)
+SELECT timestamp AS "Čas skenu", ip_address AS "Zasažený stroj", nvt_name AS "Zranitelnost", cve AS "CVE ID", cvss AS "Závažnost (CVSS)", threat_level AS "Level" FROM greenbone_vulns WHERE cvss >= 5.0 ORDER BY cvss DESC;
+
+# 2. Panel: Cyber Threat Intelligence (MITRE & AbuseIPDB)
+SELECT timestamp AS "Čas detekce", src_ip AS "IP Útočníka", rule_description AS "Popis útoku", mitre_technique AS "MITRE ID", mitre_tactic AS "Taktika" FROM wazuh_alerts WHERE mitre_technique != 'N/A' OR rule_description ILIKE '%AbuseIPDB%' ORDER BY timestamp DESC;
 
 ==============================
 == DATABÁZE: SOC DIAGNOSTIKA ==
@@ -213,8 +238,8 @@ docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_addre
 # 2. Přehled hostů detekovaných Wazuhem:
 docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT agent_id, hostname, os_name, status FROM hosts;"
 
-# 3. Výpis TOP 10 zranitelností (včetně nového Windows hosta):
-docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_address, cvss, port, SUBSTRING(nvt_name, 1, 60) FROM greenbone_vulns ORDER BY cvss DESC LIMIT 10;"
+# 3. Výpis TOP 10 zranitelností (včetně CVE):
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT ip_address, cvss, cve, SUBSTRING(nvt_name, 1, 60) FROM greenbone_vulns ORDER BY cvss DESC LIMIT 10;"
 
-# 4. Poslední kritické security alerty (Level 10+):
-docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, src_ip, dst_ip, alert_level, rule_description FROM wazuh_alerts WHERE alert_level >= 10 ORDER BY timestamp DESC LIMIT 5;"
+# 4. Poslední kritické security alerty (MITRE):
+docker compose exec postgres-db psql -U soc_user -d soc_data -c "SELECT timestamp, src_ip, mitre_technique, rule_description FROM wazuh_alerts WHERE alert_level >= 10 ORDER BY timestamp DESC LIMIT 5;"
