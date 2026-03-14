@@ -56,7 +56,7 @@ def get_db_connection():
             time.sleep(5)
 
 def init_db():
-    log(f"Inicializace tabulek (v5.7.1 - OS Field Fix)...")
+    log(f"Inicializace tabulek (v5.8.0 - Pridano MITRE a CTI)...")
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -79,6 +79,7 @@ def init_db():
                 alert_level INTEGER,
                 rule_description TEXT,
                 mitre_tactic VARCHAR(100),
+                mitre_technique VARCHAR(100), -- PŘIDÁNO
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS zabbix_current (
@@ -116,6 +117,7 @@ def init_db():
         """)
         cur.execute("ALTER TABLE zabbix_current ADD COLUMN IF NOT EXISTS os_info VARCHAR(255);")
         cur.execute("ALTER TABLE zabbix_history ADD COLUMN IF NOT EXISTS os_info VARCHAR(255);")
+        cur.execute("ALTER TABLE wazuh_alerts ADD COLUMN IF NOT EXISTS mitre_technique VARCHAR(100);") # PŘIDÁNO
         conn.commit()
     except Exception as e:
         log(f"CHYBA DB INIT: {e}")
@@ -177,11 +179,15 @@ def fetch_wazuh_data(conn):
             dst_ip = agent.get('ip', '0.0.0.0')
             if dst_ip in ['127.0.0.1', 'any']: dst_ip = DOCKER_SERVER_IP
 
+            # PŘIDÁNO: Vytěžení MITRE techniky i taktiky
+            mitre_tactic = (rule.get('mitre', {}).get('tactic') or ['N/A'])[0]
+            mitre_technique = (rule.get('mitre', {}).get('id') or ['N/A'])[0]
+
             cur.execute("""
-                INSERT INTO wazuh_alerts (wazuh_id, agent_id, src_ip, dst_ip, alert_level, rule_description, mitre_tactic)
-                VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (wazuh_id) DO NOTHING
+                INSERT INTO wazuh_alerts (wazuh_id, agent_id, src_ip, dst_ip, alert_level, rule_description, mitre_tactic, mitre_technique)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (wazuh_id) DO NOTHING
             """, (hit.get('_id'), agent.get('id'), src_ip, dst_ip, rule.get('level'), 
-                  rule.get('description'), (rule.get('mitre', {}).get('tactic') or ['N/A'])[0]))
+                  rule.get('description'), mitre_tactic, mitre_technique)) # PŘIDÁNO mitre_technique
             
             if cur.rowcount > 0: new_alerts += 1
 
@@ -200,7 +206,6 @@ def fetch_zabbix_data(conn):
             'Authorization': f'Bearer {ZABBIX_API_TOKEN}'
         }
         
-        # Rozsireny dotaz na inventory (vice poli pro OS)
         payload_hosts = {
             "jsonrpc": "2.0",
             "method": "host.get",
@@ -221,7 +226,6 @@ def fetch_zabbix_data(conn):
             interfaces = host.get('interfaces', [])
             if not interfaces: continue
             
-            # Agresivni sber OS info - zkusi vsechna pole
             inventory = host.get('inventory')
             os_info = 'N/A'
             if inventory:
@@ -403,7 +407,7 @@ def cleanup_old_data(conn):
         log(f"CHYBA Retence: {e}")
 
 if __name__ == "__main__":
-    log("=== SOC INTEGRATOR v5.7.1 STARTUJE ===")
+    log("=== SOC INTEGRATOR v5.8.0 STARTUJE ===")
     init_db()
     while True:
         db_conn = get_db_connection()
